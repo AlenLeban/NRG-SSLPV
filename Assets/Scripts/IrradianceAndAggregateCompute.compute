@@ -1,0 +1,181 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+#define MAX_CASCADES 4
+
+struct FCell
+{
+	int sh_r[9];
+	int sh_g[9];
+	int sh_b[9];
+	uint count;
+	uint avgCount;
+	uint isVisible;
+};
+
+struct FCellFloat
+{
+	float sh_r[9];
+	float sh_g[9];
+	float sh_b[9];
+	uint count;
+	uint avgCount;
+	uint isVisible;
+};
+
+Texture2D<float> _CameraDepth;
+Texture2D<float4> _PositionWS;
+Texture2D<float4> _NormalWS;
+Texture2D<float4> _LitSurfaceColor;
+//RWTexture3D<float4> _SHCoefficientsVolume;
+RWStructuredBuffer<float> _VoxelOcclusionGrid;
+
+RWStructuredBuffer<FCell> _SHCoefficientsGrid0;
+RWStructuredBuffer<FCell> _SHCoefficientsGrid1;
+RWStructuredBuffer<FCell> _SHCoefficientsGrid2;
+RWStructuredBuffer<FCell> _SHCoefficientsGrid3;
+
+int _DownsampleFactor;
+int _GridWidth;
+int _GridHeight;
+int _GridDepth;
+float _GridScale;
+float _VoxelGridScale;
+int _Precision;
+float4 _LightDirection;
+float4 _CameraPositionWS;
+float _InitialEnergy = 10;
+float _CascadeScalingFactor = 2.0f;
+int _NumCascades;
+
+
+float4 SHCosineLobeL1(in float3 dir)
+{
+    static const float PI = 3.141592654f;
+	static const float CosineA0 = PI;
+	static const float CosineA1 = 2 * PI / 3;
+	return float4(
+        CosineA0 * 0.282095f,
+        CosineA1 * 0.4886025f * dir.y,
+        CosineA1 * 0.4886025f * dir.z,
+        CosineA1 * 0.4886025f * dir.x
+    );
+
+}
+
+FCellFloat SHCosineLobeL2(in float3 dir)
+{
+	
+	static const float PI = 3.141592654f;
+	static const float CosineA0 = PI;
+	static const float CosineA1 = 2 * PI / 3;
+	static const float CosineA2 = PI * 0.25f;
+	FCellFloat coeffs = (FCellFloat) 0;
+	coeffs.sh_r[0] = CosineA0 * 0.282095f;
+	
+	coeffs.sh_r[1] = CosineA1 * 0.4886025f * dir.y;
+	coeffs.sh_r[2] = CosineA1 * 0.4886025f * dir.z;
+	coeffs.sh_r[3] = CosineA1 * 0.4886025f * dir.x;
+	
+	coeffs.sh_r[4] = CosineA2 * 1.092548f * dir.x * dir.y;
+	coeffs.sh_r[5] = CosineA2 * 1.092548f * dir.y * dir.z;
+	coeffs.sh_r[6] = CosineA2 * 0.315392f * (3.0f * dir.z * dir.z - 1.0f);
+	coeffs.sh_r[7] = CosineA2 * 1.092548f * dir.x * dir.z;
+	coeffs.sh_r[8] = CosineA2 * 0.546274f * (dir.x * dir.x - dir.y * dir.y);
+	
+	return coeffs;
+
+
+}
+
+void SHEvalBasis9(float3 d, out float b[9])
+{
+	float x = d.x;
+	float y = d.y;
+	float z = d.z;
+
+	b[0] = 0.282095;
+
+	b[1] = 0.488603 * y;
+	b[2] = 0.488603 * z;
+	b[3] = 0.488603 * x;
+
+	b[4] = 1.092548 * x * y;
+	b[5] = 1.092548 * y * z;
+	b[6] = 0.315392 * (3.0 * z * z - 1.0);
+	b[7] = 1.092548 * x * z;
+	b[8] = 0.546274 * (x * x - y * y);
+}
+
+
+
+[numthreads(16,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // TODO: insert actual code here!
+    
+	int2 pixel = id.xy;
+	int2 pixelDownsample = pixel * _DownsampleFactor;
+	float depth = _CameraDepth[pixelDownsample];
+	if (depth < 0.001)
+	{
+		return;
+	}
+	
+	float3 normalWS = _NormalWS[pixelDownsample].xyz;
+
+	float3 litSurfaceColor = _LitSurfaceColor[pixelDownsample].xyz;
+    
+	FCellFloat shCoefficients = SHCosineLobeL2(normalWS.xyz);
+	//float4 shCoefficients = SHCosineLobeL1(float3(0,0,1));
+	float intensityFactor = _InitialEnergy;
+	float Is = intensityFactor;
+	
+    
+    // TODO: consider direction of light and surfel weight
+	//RWStructuredBuffer<FCell> buffers[MAX_CASCADES] = { _SHCoefficientsGrid0, _SHCoefficientsGrid1, _SHCoefficientsGrid2, _SHCoefficientsGrid3 };
+
+	RWStructuredBuffer<FCell> _SHCoefficientsGrid = _SHCoefficientsGrid0;
+	float cascadeGridScale = _GridScale;
+		
+	float cascadeGridScaleInv = 1.0f / cascadeGridScale;
+	//float cascadeGridScale = _GridScale * pow(_CascadeScalingFactor, c);
+	float3 cameraPositionWS = round(_CameraPositionWS.xyz * cascadeGridScaleInv) * cascadeGridScale;
+	float3 cameraRelativePosition = _PositionWS[pixelDownsample].xyz - cameraPositionWS;
+	float3 posColor2 = cameraRelativePosition;
+	float3 pos = cameraRelativePosition * cascadeGridScaleInv + float3(_GridWidth, _GridHeight, _GridDepth) * 0.5f;
+	int3 gridPos = floor(pos);
+	if (!(gridPos.x >= _GridWidth - 2 || gridPos.y >= _GridHeight - 2 || gridPos.z >= _GridDepth - 2 || gridPos.x < 1 || gridPos.y < 1 || gridPos.z < 1))
+	{
+
+		int gridPositionToIndex = gridPos.x + gridPos.y * (_GridWidth) + gridPos.z * (_GridWidth * _GridHeight);
+		float3 toPixelDirection = -normalize(posColor2 - _CameraPositionWS.xyz);
+		float grazingFactor = max(0.08, dot(-toPixelDirection, normalWS));
+		float pixelFactorSqrt = 1.0f / (depth * depth) * 0.000001f / (grazingFactor) * cascadeGridScaleInv * _DownsampleFactor * _DownsampleFactor;
+	
+		float sh_r[9];
+		float sh_g[9];
+		float sh_b[9];
+		float isPixelFactorSqrtPrecision = Is * pixelFactorSqrt * _Precision;
+		for (int i = 0; i < 9; i++)
+		{
+
+			int sh_r_encoded_i = litSurfaceColor.r * shCoefficients.sh_r[i] * isPixelFactorSqrtPrecision;
+			int sh_g_encoded_i = litSurfaceColor.g * shCoefficients.sh_r[i] * isPixelFactorSqrtPrecision;
+			int sh_b_encoded_i = litSurfaceColor.b * shCoefficients.sh_r[i] * isPixelFactorSqrtPrecision;
+
+			InterlockedAdd(_SHCoefficientsGrid[gridPositionToIndex].sh_r[i], sh_r_encoded_i);
+			InterlockedAdd(_SHCoefficientsGrid[gridPositionToIndex].sh_g[i], sh_g_encoded_i);
+			InterlockedAdd(_SHCoefficientsGrid[gridPositionToIndex].sh_b[i], sh_b_encoded_i);
+		}
+		_SHCoefficientsGrid[gridPositionToIndex].isVisible = 1;
+		
+		// InterlockedAdd(_SHCoefficientsGrid[gridPositionToIndex].count, pixelFactorSqrt * _Precision);
+		InterlockedAdd(_SHCoefficientsGrid[gridPositionToIndex].avgCount, 1);
+       
+        
+	}
+}

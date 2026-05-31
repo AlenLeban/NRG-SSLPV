@@ -1,0 +1,361 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#pragma kernel CopyToVolumeTexture
+#pragma kernel PropagateIrradiance
+#pragma kernel AddNewLighting
+#pragma kernel ClearVoxelOcclusionGrid
+#pragma kernel ShiftGrid
+
+#define MAX_CASCADES 4
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+struct FCell
+{
+	int sh_r[9];
+	int sh_g[9];
+	int sh_b[9];
+	uint count;
+	uint avgCount;
+	uint isVisible;
+};
+
+struct FCellFloat
+{
+	float sh_r[9];
+	float sh_g[9];
+	float sh_b[9];
+	uint count;
+	uint avgCount;
+	uint isVisible;
+};
+
+RWStructuredBuffer<FCell> _SHCoefficientsGrid0;
+RWStructuredBuffer<FCell> _SHCoefficientsGrid1;
+RWStructuredBuffer<FCell> _SHCoefficientsGrid2;
+RWStructuredBuffer<FCell> _SHCoefficientsGrid3;
+
+StructuredBuffer<FCell> _SHCoefficientsGridOld;
+
+RWStructuredBuffer<FCell> _SHCoefficientsGridNew0;
+RWStructuredBuffer<FCell> _SHCoefficientsGridNew1;
+RWStructuredBuffer<FCell> _SHCoefficientsGridNew2;
+RWStructuredBuffer<FCell> _SHCoefficientsGridNew3;
+
+RWStructuredBuffer<FCell> _SHCoefficientsGridFinal;
+RWTexture3D<float4> _SHCoefficientsVolume;
+RWStructuredBuffer<float> _VoxelOcclusionGrid;
+
+int _GridWidth;
+int _GridHeight;
+int _GridDepth;
+int _Downsample;
+int _Precision;
+int _NumCascades;
+float _VoxelGridScale;
+
+static const float4 ConeSHL1[6] =
+{
+	float4(0.282094f, 0.0f, 0.0f, 0.2443012f),
+	float4(0.282094f, 0.2443012f, 0.0f, 0.0f),
+	float4(0.282094f, 0.0f, 0.2443012f, 0.0f),
+	float4(0.282094f, 0.0f, 0.0f, -0.2443012f),
+	float4(0.282094f, -0.2443012f, 0.0f, 0.0f),
+	float4(0.282094f, 0.0f, -0.2443012f, 0.0f),
+};
+FCellFloat ScaleFCellFloat(in FCellFloat cell, float factor)
+{
+	FCellFloat newCell = (FCellFloat) 0;
+	newCell.avgCount = cell.avgCount;
+	newCell.count = cell.count;
+	newCell.isVisible = cell.isVisible;
+	for (int i = 0; i < 9; i++)
+	{
+		newCell.sh_r[i] = cell.sh_r[i] * factor;
+		newCell.sh_g[i] = cell.sh_g[i] * factor;
+		newCell.sh_b[i] = cell.sh_b[i] * factor;
+	}
+	return newCell;
+}
+
+FCellFloat FCellToFloat(in FCell cell)
+{
+	FCellFloat fcellFloat = (FCellFloat) 0;
+	for (int i = 0; i < 9; i++)
+	{
+		fcellFloat.sh_r[i] = ((float) cell.sh_r[i]) / _Precision;
+		fcellFloat.sh_g[i] = ((float) cell.sh_g[i]) / _Precision;
+		fcellFloat.sh_b[i] = ((float) cell.sh_b[i]) / _Precision;
+	}
+	fcellFloat.count = cell.count;
+	fcellFloat.avgCount = cell.avgCount;
+	fcellFloat.isVisible = cell.isVisible;
+	return fcellFloat;
+}
+
+FCell FCellFloatToInt(in FCellFloat cell)
+{
+	FCell fcell = (FCell) 0;
+	for (int i = 0; i < 9; i++)
+	{
+		fcell.sh_r[i] = floor(cell.sh_r[i] * _Precision);
+		fcell.sh_g[i] = floor(cell.sh_g[i] * _Precision);
+		fcell.sh_b[i] = floor(cell.sh_b[i] * _Precision);
+	}
+	fcell.count = cell.count;
+	fcell.avgCount = cell.avgCount;
+	fcell.isVisible = cell.isVisible;
+	return fcell;
+}
+
+float4 SHCone90Degree(in float3 dir)
+{
+	float4 c = float4(
+        1.77245f,
+        1.53499f * dir.y,
+        1.53499f * dir.z,
+        1.53499f * dir.x
+    );
+
+	return c * (1.0 / (2.0 * 3.14159265));
+}
+
+void SHEvalBasis9(float3 d, out float b[9])
+{
+	float x = d.x;
+	float y = d.y;
+	float z = d.z;
+
+	b[0] = 0.282095;
+
+	b[1] = 0.488603 * y;
+	b[2] = 0.488603 * z;
+	b[3] = 0.488603 * x;
+
+	b[4] = 1.092548 * x * y;
+	b[5] = 1.092548 * y * z;
+	b[6] = 0.315392 * (3.0 * z * z - 1.0);
+	b[7] = 1.092548 * x * z;
+	b[8] = 0.546274 * (x * x - y * y);
+}
+
+FCellFloat SHCone90DegreeL2(in float3 dir)
+{
+	FCellFloat data = (FCellFloat) 0;
+
+	float b[9];
+	SHEvalBasis9(dir, b);
+
+	const float k0 = 1.00;
+	const float k1 = 0.75; 
+	const float k2 = 0.25;
+
+	data.sh_r[0] = k0 * b[0];
+
+	data.sh_r[1] = k1 * b[1];
+	data.sh_r[2] = k1 * b[2];
+	data.sh_r[3] = k1 * b[3];
+
+	data.sh_r[4] = k2 * b[4];
+	data.sh_r[5] = k2 * b[5];
+	data.sh_r[6] = k2 * b[6];
+	data.sh_r[7] = k2 * b[7];
+	data.sh_r[8] = k2 * b[8];
+
+	return data;
+}
+
+
+
+[numthreads(2, 2, 2)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    int idx = id.x + id.y * (_GridWidth) + id.z * (_GridWidth * _GridHeight);
+	FCell emptyCell = (FCell) 0;
+
+	FCell initCell = (FCell) 0;
+	// initCell.count = 1;
+	// initCell.avgCount = 1;
+
+	_SHCoefficientsGrid0[idx] = emptyCell;
+	_SHCoefficientsGridNew0[idx] = initCell;
+
+	/*_SHCoefficientsGrid1[idx] = emptyCell;
+	_SHCoefficientsGridNew1[idx] = initCell;
+
+	_SHCoefficientsGrid2[idx] = emptyCell;
+	_SHCoefficientsGridNew2[idx] = initCell;
+
+	_SHCoefficientsGrid3[idx] = emptyCell;
+	_SHCoefficientsGridNew3[idx] = initCell;*/
+
+}
+
+[numthreads(2, 2, 2)]
+void ClearVoxelOcclusionGrid(uint3 id : SV_DispatchThreadID)
+{
+	int pos = round(id.x + id.y * (_GridWidth / _VoxelGridScale) + id.z * (_GridWidth / _VoxelGridScale * _GridHeight / _VoxelGridScale));
+	_VoxelOcclusionGrid[pos] = 0;
+}
+
+
+[numthreads(2,2,2)]
+void CopyToVolumeTexture(uint3 id : SV_DispatchThreadID)
+{
+	/*int gridPositionIndex = id.x + id.y * (_GridWidth) + id.z * (_GridWidth * _GridHeight);
+    
+    int4 sh_r = _SHCoefficientsGrid[gridPositionIndex].sh_r;
+	int4 sh_g = _SHCoefficientsGrid[gridPositionIndex].sh_g;
+	int4 sh_b = _SHCoefficientsGrid[gridPositionIndex].sh_b;
+	float count = float(_SHCoefficientsGrid[gridPositionIndex].count) / _Precision;
+	float avgCount = float(_SHCoefficientsGrid[gridPositionIndex].avgCount);
+	
+	float countf = (count * count) * 0.1f / (avgCount * avgCount) * _Downsample*_Downsample;
+    
+	float4 sh_r_f = float4(sh_r.x, sh_r.y, sh_r.z, sh_r.w);
+	float4 sh_g_f = float4(sh_g.x, sh_g.y, sh_g.z, sh_g.w);
+	float4 sh_b_f = float4(sh_b.x, sh_b.y, sh_b.z, sh_b.w);*/
+	
+    
+	/*if (avgCount != 0)
+	{
+		sh_r_f /= _Precision;
+		sh_g_f /= _Precision;
+		sh_b_f /= _Precision;
+		
+		sh_r_f *= countf;
+		sh_g_f *= countf;
+		sh_b_f *= countf;
+		
+		_SHCoefficientsGrid[gridPositionIndex].sh_r = (sh_r_f * _Precision);
+		_SHCoefficientsGrid[gridPositionIndex].sh_g = (sh_g_f * _Precision);
+		_SHCoefficientsGrid[gridPositionIndex].sh_b = (sh_b_f * _Precision);
+		
+		//_SHCoefficientsVolume[id.xyz] = sh_r_f;
+	}
+	else
+	{
+		//_SHCoefficientsGrid[gridPositionIndex] = (FCell) 0;
+		//_SHCoefficientsGrid[gridPositionIndex].sh_r = (float4(1, 1, 1, 1) * _Precision * 0);
+	
+	}*/
+	
+}
+
+float L2Dot(float a[9], float b[9])
+{
+	float sum = 0;
+	for (int i = 0; i < 9; i++)
+	{
+		sum += a[i] * b[i];
+	}
+	return sum;
+}
+
+float3 SHDot(in FCellFloat first, in FCellFloat second)
+{
+		
+	return float3(L2Dot(first.sh_r, second.sh_r), L2Dot(first.sh_g, second.sh_g), L2Dot(first.sh_b, second.sh_b));
+}
+
+float3 SHDotFloatL2(in FCellFloat first, in float secondSH[9])
+{
+	return float3(L2Dot(first.sh_r, secondSH), L2Dot(first.sh_g, secondSH), L2Dot(first.sh_b, secondSH));
+}
+
+void AddContributionFromNeighbor(uint3 id, inout FCellFloat gatheredSHCoeffs, in int3 pos, in int3 offset, in int offsetIndex)
+{
+	int3 neighborPos = id.xyz + offset;
+	
+	// if neighbor falls out of grid, skip
+	if (neighborPos.x >= _GridWidth || neighborPos.y >= _GridHeight || neighborPos.z >= _GridDepth || neighborPos.x < 1 || neighborPos.y < 1 || neighborPos.z < 1)
+	{
+		return;
+	}
+	
+	int neighborGridPositionIndex = neighborPos.x + neighborPos.y * (_GridWidth) + neighborPos.z * (_GridWidth * _GridHeight);
+	FCell neighborSHCoeffs = _SHCoefficientsGridOld[neighborGridPositionIndex];
+
+	FCellFloat neighborSHCoeffsFloat = FCellToFloat(neighborSHCoeffs);
+	
+	// FCellFloat coneSHCoeffs = SHCone90DegreeL2(-float3(offset.x, offset.y, offset.z));
+	// float4 coneSHCoeffsFloat4 = SHCone90Degree(-float3(offset.x, offset.y, offset.z));
+	float4 coneSHCoeffsFloat4 = ConeSHL1[offsetIndex];
+	float coneSHCoeffs4[4] = { coneSHCoeffsFloat4.x, coneSHCoeffsFloat4.y, coneSHCoeffsFloat4.z, coneSHCoeffsFloat4.w };
+	float3 incommingLuminenceL1 = float3(0, 0, 0);
+	for (int i = 0; i < 4; i++)
+	{
+		incommingLuminenceL1.r += neighborSHCoeffsFloat.sh_r[i] * coneSHCoeffs4[i];
+		incommingLuminenceL1.g += neighborSHCoeffsFloat.sh_g[i] * coneSHCoeffs4[i];
+		incommingLuminenceL1.b += neighborSHCoeffsFloat.sh_b[i] * coneSHCoeffs4[i];
+	}
+	
+	for (int j = 0; j < 4; j++)
+	{
+		// coneSHCoeffs only has sh_r
+		gatheredSHCoeffs.sh_r[j] += coneSHCoeffs4[j] * incommingLuminenceL1.r;
+		gatheredSHCoeffs.sh_g[j] += coneSHCoeffs4[j] * incommingLuminenceL1.g;
+		gatheredSHCoeffs.sh_b[j] += coneSHCoeffs4[j] * incommingLuminenceL1.b;
+	}
+	
+}
+
+
+
+[numthreads(2, 2, 2)]
+void PropagateIrradiance(uint3 id : SV_DispatchThreadID)
+{
+	float propagation = 0.6f;
+	FCellFloat gatheredSHCoeffs = (FCellFloat) 0;
+	int pos = id.x + id.y * (_GridWidth) + id.z * (_GridWidth * _GridHeight);
+	gatheredSHCoeffs.isVisible = _SHCoefficientsGridOld[pos].isVisible;
+	
+	// gather irradiance from neighboring cells
+	AddContributionFromNeighbor(id, gatheredSHCoeffs, pos, int3(1, 0, 0), 3);
+	AddContributionFromNeighbor(id, gatheredSHCoeffs, pos, int3(-1, 0, 0), 0);
+	AddContributionFromNeighbor(id, gatheredSHCoeffs, pos, int3(0, 1, 0), 4);
+	AddContributionFromNeighbor(id, gatheredSHCoeffs, pos, int3(0, -1, 0), 1);
+	AddContributionFromNeighbor(id, gatheredSHCoeffs, pos, int3(0, 0, 1), 5);
+	AddContributionFromNeighbor(id, gatheredSHCoeffs, pos, int3(0, 0, -1), 2);
+
+	FCell gatheredSHCoeffsInt = FCellFloatToInt(gatheredSHCoeffs);
+	_SHCoefficientsGridNew0[pos].isVisible = gatheredSHCoeffs.isVisible;
+	// add gathered irradiance to the current cell
+	for (int i = 0; i < 9; i++)
+	{
+		_SHCoefficientsGridNew0[pos].sh_r[i] = _SHCoefficientsGridOld[pos].sh_r[i] * (1 - propagation) + gatheredSHCoeffsInt.sh_r[i] * propagation;
+		_SHCoefficientsGridNew0[pos].sh_g[i] = _SHCoefficientsGridOld[pos].sh_g[i] * (1 - propagation) + gatheredSHCoeffsInt.sh_g[i] * propagation;
+		_SHCoefficientsGridNew0[pos].sh_b[i] = _SHCoefficientsGridOld[pos].sh_b[i] * (1 - propagation) + gatheredSHCoeffsInt.sh_b[i] * propagation;
+	}
+
+}
+
+[numthreads(2, 2, 2)]
+void AddNewLighting(uint3 id : SV_DispatchThreadID)
+{
+	int pos = id.x + id.y * (_GridWidth) + id.z * (_GridWidth * _GridHeight);
+	float updateAlpha = 0.4f;
+	for (int i = 0; i < 9; i++)
+	{
+		_SHCoefficientsGridFinal[pos].sh_r[i] = _SHCoefficientsGridNew0[pos].sh_r[i] * updateAlpha + (1 - updateAlpha) * _SHCoefficientsGridFinal[pos].sh_r[i];
+		_SHCoefficientsGridFinal[pos].sh_g[i] = _SHCoefficientsGridNew0[pos].sh_g[i] * updateAlpha + (1 - updateAlpha) * _SHCoefficientsGridFinal[pos].sh_g[i];
+		_SHCoefficientsGridFinal[pos].sh_b[i] = _SHCoefficientsGridNew0[pos].sh_b[i] * updateAlpha + (1 - updateAlpha) * _SHCoefficientsGridFinal[pos].sh_b[i];
+	}
+}
+
+float3 _CameraPositionOffset;
+RWStructuredBuffer<FCell> _GridAfterShift;
+
+[numthreads(2, 2, 2)]
+void ShiftGrid(uint3 id : SV_DispatchThreadID)
+{
+	int pos = id.x + id.y * (_GridWidth) + id.z * (_GridWidth * _GridHeight);
+	int3 newPosVector = id.xyz + round(_CameraPositionOffset);
+	if (newPosVector.x >= _GridWidth - 1 || newPosVector.y >= _GridHeight - 1 || newPosVector.z >= _GridDepth - 1 || newPosVector.x < 1 || newPosVector.y < 1 || newPosVector.z < 1)
+	{
+		_GridAfterShift[pos] = (FCell) 0;
+		return;
+	}
+	int newPos = newPosVector.x + newPosVector.y * (_GridWidth) + newPosVector.z * (_GridWidth * _GridHeight);
+	_GridAfterShift[pos] = _SHCoefficientsGridFinal[newPos];
+}
